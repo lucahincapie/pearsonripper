@@ -1,0 +1,75 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body {
+        font-family: -apple-system, system-ui, sans-serif;
+        width: 290px;
+        padding: 12px;
+        margin: 0;
+      }
+      h3 { margin: 0 0 8px; font-size: 14px; }
+      label { font-size: 11px; color: #555; display: block; margin-top: 6px; }
+      input, select, button {
+        width: 100%;
+        padding: 6px;
+        margin-top: 2px;
+        box-sizing: border-box;
+        font-size: 12px;
+      }
+      button { cursor: pointer; }
+      hr { margin: 12px 0; border: none; border-top: 1px solid #eee; }
+      .row { display: flex; gap: 6px; }
+      .row button { flex: 1; }
+      #status { font-size: 11px; color: #666; margin-top: 8px; min-height: 14px; }
+      .hint { font-size: 10px; color: #888; margin-top: 4px; }
+    </style>
+  </head>
+  <body>
+    <h3>Pearson Review Helper</h3>
+
+    <label>License Key</label>
+    <input id="license" type="text" placeholder="PRH-XXXX-XXXX-XXXX" />
+    <button id="activate" style="margin-top:4px">Activate</button>
+    <div id="licenseStatus" style="font-size:11px;margin-top:4px"></div>
+
+    <hr />
+
+    <label>OpenAI API Key</label>
+    <input id="key" type="password" placeholder="sk-..." />
+
+    <label>Model</label>
+    <select id="model">
+      <option value="gpt-4o-mini">gpt-4o-mini (cheapest)</option>
+      <option value="gpt-4o">gpt-4o</option>
+      <option value="gpt-4.1">gpt-4.1</option>
+      <option value="gpt-4.1-mini">gpt-4.1-mini</option>
+    </select>
+
+    <button id="save">Save settings</button>
+
+    <hr />
+
+    <div class="row">
+      <button id="solve">Solve (Alt+A)</button>
+      <button id="solveNext">Solve + Next (Alt+S)</button>
+    </div>
+
+    <hr />
+
+    <button id="autoToggle">Start Auto Mode</button>
+    <div class="hint">
+      Auto mode keeps solving + advancing every question on this tab until the
+      assignment ends or you turn it off.
+    </div>
+
+    <hr />
+
+    <div id="usage" style="font-size:11px;color:#444;line-height:1.5"></div>
+
+    <div id="status"></div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

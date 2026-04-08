@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "Pearson Review Helper",
+  "version": "0.1.0",
+  "description": "Auto-answers Pearson MyLab review questions via the OpenAI API.",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Pearson Review Helper"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "commands": {
+    "solve-question": {
+      "suggested_key": { "default": "Alt+A" },
+      "description": "Solve current Pearson question (no submit)"
+    },
+    "solve-and-next": {
+      "suggested_key": { "default": "Alt+S" },
+      "description": "Solve, click Submit, then Next"
+    }
+  }
+}
