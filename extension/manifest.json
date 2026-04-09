@@ -1,0 +1,45 @@
+{
+  "manifest_version": 3,
+  "name": "Coursepilot",
+  "version": "0.1.0",
+  "description": "Auto-solve study tool for McGraw Hill Recharge and Pearson MyLab. 100% accuracy on Recharge, AI-assisted on MyLab.",
+  "permissions": ["storage", "scripting", "activeTab", "tabs"],
+  "host_permissions": [
+    "https://learning.mheducation.com/*",
+    "https://*.mheducation.com/*",
+    "https://*.pearson.com/*",
+    "https://*.pearsoned.com/*",
+    "https://api.openai.com/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Coursepilot"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://learning.mheducation.com/*"],
+      "js": ["mh-content.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["mh-injected.js"],
+      "matches": ["https://learning.mheducation.com/*"]
+    }
+  ],
+  "commands": {
+    "solve-question": {
+      "suggested_key": { "default": "Alt+A" },
+      "description": "Solve current question"
+    },
+    "solve-and-next": {
+      "suggested_key": { "default": "Alt+S" },
+      "description": "Solve and advance (Pearson)"
+    }
+  }
+}

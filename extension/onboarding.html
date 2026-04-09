@@ -1,0 +1,197 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Welcome — Coursepilot</title>
+    <style>
+      :root {
+        --bg: #0f1419;
+        --bg-elev: #1a2028;
+        --bg-elev-2: #232a34;
+        --text: #e8eaed;
+        --text-dim: #9aa0a6;
+        --text-mute: #5f6368;
+        --border: #2d3540;
+        --brand: #6366f1;
+        --green: #2ecc71;
+      }
+      * { box-sizing: border-box; }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        margin: 0;
+        padding: 60px 20px;
+        min-height: 100vh;
+      }
+      .wrap { max-width: 760px; margin: 0 auto; }
+      .logo-row { display: flex; align-items: center; gap: 14px; margin-bottom: 8px; }
+      .logo {
+        width: 52px;
+        height: 52px;
+        background: linear-gradient(135deg, var(--brand), #8b5cf6);
+        border-radius: 12px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #fff;
+        font-weight: 900;
+        font-size: 20px;
+        letter-spacing: -1px;
+      }
+      h1 { font-size: 30px; margin: 0; letter-spacing: -0.5px; }
+      .subtitle { color: var(--text-dim); font-size: 14px; margin-top: 4px; }
+      .hero {
+        background: linear-gradient(135deg, #1a2028, #14191f);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 30px;
+        margin: 32px 0;
+      }
+      .hero h2 { margin: 0 0 12px; font-size: 22px; }
+      .hero p { margin: 0; color: var(--text-dim); line-height: 1.6; font-size: 14px; }
+      .platforms {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+        margin-top: 20px;
+      }
+      .platform-card {
+        background: var(--bg-elev);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 16px;
+      }
+      .platform-card h3 { margin: 0 0 6px; font-size: 14px; }
+      .platform-card .tag {
+        font-size: 9px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        padding: 2px 6px;
+        border-radius: 10px;
+        margin-bottom: 8px;
+        display: inline-block;
+        font-weight: 600;
+      }
+      .tag.mh { background: rgba(228, 0, 43, 0.2); color: #ff5577; }
+      .tag.pearson { background: rgba(0, 122, 204, 0.2); color: #4ab3ff; }
+      .platform-card p { margin: 0; color: var(--text-dim); font-size: 12px; line-height: 1.5; }
+
+      .steps { margin: 32px 0; }
+      .step {
+        display: flex;
+        gap: 16px;
+        background: var(--bg-elev);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 18px 20px;
+        margin-bottom: 12px;
+      }
+      .step-num {
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+        background: var(--brand);
+        color: #fff;
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+        font-size: 14px;
+      }
+      .step-body { flex: 1; }
+      .step-title { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+      .step-desc { font-size: 13px; color: var(--text-dim); line-height: 1.5; }
+      .step-desc code {
+        background: var(--bg);
+        padding: 1px 6px;
+        border-radius: 4px;
+        font-size: 12px;
+        color: var(--text);
+      }
+      .footer {
+        margin-top: 40px;
+        padding-top: 20px;
+        border-top: 1px solid var(--border);
+        color: var(--text-mute);
+        font-size: 12px;
+        text-align: center;
+        line-height: 1.6;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="logo-row">
+        <div class="logo">CP</div>
+        <div>
+          <h1>Welcome to Coursepilot</h1>
+          <div class="subtitle">The fastest way through online homework.</div>
+        </div>
+      </div>
+
+      <div class="hero">
+        <h2>One extension. Two platforms. Endless homework done.</h2>
+        <p>
+          Coursepilot supports both McGraw Hill Recharge and Pearson MyLab. On Recharge,
+          it reads McGraw's own answer data — 100% accuracy, zero AI cost, instant.
+          On MyLab, it uses your OpenAI key to power a fast solver across every question
+          type you'll encounter.
+        </p>
+        <div class="platforms">
+          <div class="platform-card">
+            <span class="tag mh">McGraw Hill</span>
+            <h3>Recharge</h3>
+            <p>100% accuracy. No API key required. Multiple choice, fill-in-the-blank, true/false, ordering, matching, multi-select.</p>
+          </div>
+          <div class="platform-card">
+            <span class="tag pearson">Pearson</span>
+            <h3>MyLab Review</h3>
+            <p>~95% accuracy via your OpenAI key. Multiple choice, multi-select, sorting, ranking, vocab fill-in. BYOK.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="steps">
+        <div class="step">
+          <div class="step-num">1</div>
+          <div class="step-body">
+            <div class="step-title">Activate your license</div>
+            <div class="step-desc">
+              Click the <strong>CP</strong> icon in your Chrome toolbar. Paste your license key
+              and hit Activate. You'll see a green dot when it's accepted.
+            </div>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-num">2</div>
+          <div class="step-body">
+            <div class="step-title">(Pearson only) Add your OpenAI key</div>
+            <div class="step-desc">
+              Open settings (gear icon) and paste an OpenAI API key starting with <code>sk-</code>.
+              Recharge users can skip this step.
+            </div>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-num">3</div>
+          <div class="step-body">
+            <div class="step-title">Open an assignment and click Start</div>
+            <div class="step-desc">
+              Go to <code>learning.mheducation.com</code> or your Pearson MyLab page. Open the
+              Coursepilot popup and hit the big <strong>Start</strong> button. The bot answers each
+              question, picks confidence, and advances. Watch your accuracy climb live.
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="footer">
+        Coursepilot is for educational and personal study use. By using this tool you
+        agree to comply with your school's academic integrity policy. We are not
+        affiliated with McGraw Hill Education or Pearson.
+      </div>
+    </div>
+  </body>
+</html>
