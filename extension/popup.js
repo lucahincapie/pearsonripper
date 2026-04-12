@@ -240,7 +240,7 @@ function escapeAttr(s) {
   paintStatus(isOn ? data.status : null);
   refreshStats();
 
-  // Hide Pearson-only settings on Recharge tabs and vice versa
+  // Hide platform-specific settings
   if (activePlatform === "mh") {
     $("apiKeyRow").style.display = "none";
     $("modelRow").style.display = "none";
