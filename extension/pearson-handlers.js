@@ -626,6 +626,26 @@ async function askOpenAI(payload) {
       labels.map((c, i) => `  ${i}. ${c}`).join("\n") +
       `\nTargets (regions on the image):\n` +
       targets.map((c, i) => `  ${i}. ${c}`).join("\n");
+  } else if (kind === "dropdowns") {
+    const { blanks } = payload;
+    sys =
+      "You are answering a Pearson MyLab fill-in-the-blank question where each blank " +
+      "is a dropdown of options. For each blank, choose the option that correctly " +
+      "completes the sentence. Return ONLY a JSON object of the form " +
+      '{"assignments":[{"blank":<blank index>,"option":<option index>}, ...],"reason":"<short reasoning>"}. ' +
+      "Include exactly one entry per blank. Indexes are 0-based.";
+    userText =
+      cachePrefix +
+      `Question: ${question}\n` +
+      `Instructions: ${instructions || "(none)"}\n` +
+      `Blanks (each is a dropdown to fill — pick one option per blank):\n` +
+      blanks
+        .map(
+          (b) =>
+            `  Blank ${b.index}: "____ ${b.sentence}"\n` +
+            b.options.map((o, j) => `      ${j}. ${o}`).join("\n")
+        )
+        .join("\n");
   } else if (kind === "ranking") {
     const { items, slots } = payload;
     sys =
@@ -742,7 +762,12 @@ function solveInPage(autoAdvance, isAutoMode) {
   const isTop = window === window.top;
 
   let attempts = 0;
-  const maxAttempts = isTop ? 25 : 1; // ~7.5s in top frame; subframes bail immediately
+  // Legacy MyLab loads the question inside an iframe at Service/PlayerLaunch.ashx
+  // or Player.aspx. That frame needs the same polling budget as the top frame
+  // because runSolve is fired before the iframe has finished rendering.
+  const isXlPlayerFrame =
+    !isTop && /Player(Launch|\.aspx)/i.test((location && location.href) || "");
+  const maxAttempts = isTop || isXlPlayerFrame ? 25 : 1; // ~7.5s; other subframes bail immediately
   const solvedPartIds = new Set();
 
   // Auto-mode kill switch. Only enforced when this run was started by
@@ -788,6 +813,67 @@ function solveInPage(autoAdvance, isAutoMode) {
   }
 
   function findStuff() {
+    // Legacy MyLab XL HTML5 Player — multiple choice. Lives in an iframe at
+    // Service/PlayerLaunch.ashx / Player.aspx and renders Dojo dijit widgets
+    // with widgetid="xl_player_controls__MultipleChoiceAnswerButton_N", each
+    // wrapping an <input type="radio"> whose aria-label is "A. <choice text>".
+    // Detected here because the legacy DOM lacks modern Pearson selectors.
+    const xlMcButtons = Array.from(
+      document.querySelectorAll(
+        '[widgetid^="xl_player_controls__MultipleChoiceAnswerButton_"]'
+      )
+    );
+    if (xlMcButtons.length) {
+      const options = xlMcButtons
+        .map((btn, idx) => {
+          const radio = btn.querySelector('input[type="radio"]');
+          const aria = (radio && radio.getAttribute("aria-label")) || "";
+          // aria-label e.g. "A. False. In statistics, results are not..."
+          const m = aria.match(/^([A-Z])[.)]\s*([\s\S]*)$/);
+          const letter = m ? m[1] : String.fromCharCode(65 + idx);
+          const text = (m ? m[2] : aria)
+            .replace(/[​-‍﻿]/g, "")
+            .replace(/\s+/g, " ")
+            .trim();
+          return { letter, text, radio, btn };
+        })
+        .filter((o) => o.radio);
+      if (options.length) {
+        // Walk up from the first option to find the MultipleChoice widget
+        // container — it holds the question stem alongside the option buttons.
+        const container =
+          xlMcButtons[0].closest(
+            '[widgetid^="xl_player_controls_MultipleChoice"]:not([widgetid*="Answer"])'
+          ) ||
+          xlMcButtons[0].closest(".dijitContentPane") ||
+          document.body;
+        return { kind: "xlMc", root: container, qEl: container, options };
+      }
+    }
+
+    // Legacy MyLab (mylab.pearson.com) — Dojo xlFillin dropdowns.
+    // Detected FIRST since this DOM doesn't have any modern Pearson selectors.
+    const legacyDropdowns = Array.from(document.querySelectorAll(".xlFillin"));
+    if (legacyDropdowns.length > 0) {
+      const blanks = legacyDropdowns
+        .map((el) => {
+          const sentence = el.getAttribute("ariadescription") || el.getAttribute("arialabel") || "";
+          const options = Array.from(el.querySelectorAll(".xlFillinContainer > div")).map((o) => ({
+            text: (o.textContent || "").trim(),
+            el: o,
+          }));
+          return { el, sentence, options };
+        })
+        .filter((b) => b.options.length > 0);
+      if (blanks.length > 0) {
+        const qEl =
+          document.querySelector(".contentHolder") ||
+          document.querySelector("#full") ||
+          document.body;
+        return { kind: "dropdowns", root: qEl, qEl, blanks };
+      }
+    }
+
     const picked = pickOpenPart();
 
     // If there ARE open parts but all of them are completed (already-graded
@@ -928,6 +1014,10 @@ function solveInPage(autoAdvance, isAutoMode) {
           ? doVocabSolve
           : found.kind === "labeling"
           ? doLabelingSolve
+          : found.kind === "dropdowns"
+          ? doDropdownsSolve
+          : found.kind === "xlMc"
+          ? doXlMcSolve
           : doSolve;
       fn(found).catch((e) => console.error("[pearson-bot] solve error", e));
       return;
@@ -2000,6 +2090,156 @@ function solveInPage(autoAdvance, isAutoMode) {
     );
   }
 
+  // Legacy MyLab xlFillin dropdowns solver
+  async function doDropdownsSolve(found) {
+    const { blanks } = found;
+    const questionText =
+      "Select the correct choice for each blank in the sentences below.";
+    const blankDescs = blanks.map((b, i) => {
+      const opts = b.options.map((o, j) => `${j}. ${o.text}`).join(" | ");
+      return `Blank ${i}: "____ ${b.sentence}" — Options: ${opts}`;
+    });
+    const payload = {
+      kind: "dropdowns",
+      question: questionText,
+      instructions: "Pick the correct option index for each blank.",
+      blanks: blanks.map((b, i) => ({
+        index: i,
+        sentence: b.sentence,
+        options: b.options.map((o) => o.text),
+      })),
+    };
+    let resp;
+    try {
+      resp = await chrome.runtime.sendMessage({ type: "askLLM", payload });
+    } catch (e) {
+      log("askLLM failed:", e);
+      return;
+    }
+    if (!resp || !resp.ok) {
+      log("askLLM error:", resp && resp.error);
+      return;
+    }
+    let assignments;
+    try {
+      const raw = resp.data;
+      let parsed;
+      if (raw && typeof raw === "object") {
+        parsed = raw;
+      } else {
+        const str = String(raw || "");
+        const json = str.match(/\{[\s\S]*\}/);
+        parsed = JSON.parse(json[0]);
+      }
+      assignments = parsed.assignments || (parsed.answer && parsed.answer.assignments) || [];
+    } catch (e) {
+      log("parse assignments failed:", e, "raw:", resp && resp.data);
+      return;
+    }
+    if (!assignments.length) {
+      log("no assignments returned");
+      return;
+    }
+
+    function fireMouseEvents(el) {
+      const events = ["mouseover", "mousedown", "mouseup", "click"];
+      for (const type of events) {
+        el.dispatchEvent(
+          new MouseEvent(type, { bubbles: true, cancelable: true, view: window, button: 0 })
+        );
+      }
+    }
+    function fireKey(el, key, keyCode) {
+      const init = { key, code: key, keyCode, which: keyCode, bubbles: true, cancelable: true };
+      const down = new KeyboardEvent("keydown", init);
+      Object.defineProperty(down, "keyCode", { get: () => keyCode });
+      Object.defineProperty(down, "which", { get: () => keyCode });
+      el.dispatchEvent(down);
+      const press = new KeyboardEvent("keypress", init);
+      Object.defineProperty(press, "keyCode", { get: () => keyCode });
+      Object.defineProperty(press, "which", { get: () => keyCode });
+      el.dispatchEvent(press);
+      const up = new KeyboardEvent("keyup", init);
+      Object.defineProperty(up, "keyCode", { get: () => keyCode });
+      Object.defineProperty(up, "which", { get: () => keyCode });
+      el.dispatchEvent(up);
+    }
+
+    for (const a of assignments) {
+      const blank = blanks[a.blank];
+      const option = blank && blank.options[a.option];
+      if (!blank || !option) continue;
+
+      // Ask background to set the dijit widget in MAIN world (bypasses CSP)
+      let dijitSet = false;
+      try {
+        const widgetId = blank.el.getAttribute("widgetid") || blank.el.id;
+        if (widgetId) {
+          const resp = await new Promise((resolve) => {
+            chrome.runtime.sendMessage(
+              { type: "setDijitValue", widgetId, value: option.text, optionIndex: a.option },
+              (r) => resolve(r || { ok: false })
+            );
+          });
+          if (resp && resp.ok) {
+            dijitSet = true;
+            log("dropdown blank " + a.blank + " → " + option.text + " (" + (resp.method || "dijit") + ")");
+          } else {
+            log("dijit set failed:", resp && (resp.reason || resp.error));
+          }
+        }
+      } catch (e) { log("dijit msg error:", e.message); }
+
+      if (!dijitSet) {
+        // Click trigger to open the menu table, then click the option row
+        const trigger = blank.el.querySelector(".xlFillinItem");
+        const widgetId = blank.el.getAttribute("widgetid") || (trigger && trigger.id);
+        if (trigger) {
+          trigger.focus();
+          // Use native .click() — sometimes triggers Dojo even if dispatchEvent doesn't
+          trigger.click();
+          fireMouseEvents(trigger);
+          await new Promise((r) => setTimeout(r, 400));
+        }
+        // The opened menu is a table with id `${widgetId}_menu`; rows are `${widgetId}-${idx}`
+        const menuRowId = widgetId + "-" + a.option;
+        let menuRow = document.querySelector("tr#" + CSS.escape(menuRowId));
+        if (menuRow) {
+          menuRow.click();
+          fireMouseEvents(menuRow);
+        }
+
+        // ALSO directly write into the focusNode + display span as a fallback,
+        // in case Dojo's listener won't fire for synthetic events
+        const focusNode = blank.el.querySelector('input[data-dojo-attach-point="focusNode"]');
+        if (focusNode) {
+          const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+          setter.call(focusNode, option.text);
+          focusNode.dispatchEvent(new Event("input", { bubbles: true }));
+          focusNode.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+        // Update displayed text
+        const displaySpan =
+          trigger && trigger.querySelector("span:not(.xlFillinArrow):not([role])");
+        if (displaySpan) displaySpan.textContent = option.text;
+        log("dropdown blank " + a.blank + " → " + option.text + " (forced)");
+      }
+      await new Promise((r) => setTimeout(r, 400));
+    }
+
+    // Click Check answer
+    await new Promise((r) => setTimeout(r, 500));
+    const checkBtn =
+      document.querySelector('button[command="checkanswer"]:not([disabled])') ||
+      document.querySelector('button[command="checkanswer"]');
+    if (checkBtn && !checkBtn.disabled) {
+      checkBtn.click();
+      log("clicked Check answer");
+    } else {
+      log("Check answer button not enabled");
+    }
+  }
+
   // Shared submit + advance logic (also used by choice handler)
   function submitAndAdvance(root, kind) {
     const solvedPartEl = root.closest(".section.part") || root;
@@ -2391,6 +2631,133 @@ function solveInPage(autoAdvance, isAutoMode) {
         if (autoAdvance) submitAndAdvance(root, isMulti ? "multi-select" : "radio");
       }
     );
+  }
+
+  // XL HTML5 Player multiple choice (legacy MyLab iframe). Same askLLM
+  // contract as doSolve — picks 0-based indices into the options array —
+  // but clicks the Dojo radio inputs directly and submits via the player's
+  // "Check answer" primary button instead of the modern player's
+  // `span.answer-button.submit`.
+  async function doXlMcSolve({ root, qEl, options }) {
+    const choices = options.map((o, i) => o.text || `[choice ${i + 1}]`);
+
+    // The container's text contains the prompt AND the option labels.
+    // Strip out each option's "<letter>. <text>" and "<text>" so what's
+    // left is the question stem.
+    const containerText = (qEl.innerText || qEl.textContent || "")
+      .replace(/​/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    let stem = containerText;
+    for (const o of options) {
+      if (!o.text) continue;
+      stem = stem.split(`${o.letter}. ${o.text}`).join(" ");
+      stem = stem.split(o.text).join(" ");
+    }
+    stem = stem.replace(/\s+/g, " ").trim();
+    if (!stem) stem = containerText;
+
+    const imageDescriptions = collectImageDescriptions(root);
+    const images = await collectImages(root);
+
+    const mainCtx = await fetchMainWorldContext();
+    const subject = buildSubjectString(mainCtx && mainCtx.meta);
+
+    const fullQuestion =
+      stem +
+      (imageDescriptions.length
+        ? "\n\nImage descriptions:\n- " + imageDescriptions.join("\n- ")
+        : "");
+
+    log("XL MC Q:", stem.slice(0, 100));
+    log("choices:", choices);
+    log("subject:", subject || "(none)");
+
+    chrome.runtime.sendMessage(
+      {
+        type: "askLLM",
+        payload: {
+          question: fullQuestion,
+          stablePrefix: "",
+          instructions: "Choose the correct answer below.",
+          choices,
+          multi: false,
+          images,
+          subject,
+        },
+      },
+      (resp) => {
+        if (!resp || !resp.ok) {
+          console.error("[pearson-bot] LLM error:", resp && resp.error);
+          return;
+        }
+        const data = resp.data || {};
+        let answers = Array.isArray(data.answers) ? data.answers : [data.answers];
+        answers = answers
+          .map((n) => Number(n))
+          .filter((n) => Number.isInteger(n) && n >= 0 && n < options.length);
+
+        log("picked:", answers, "reason:", data.reasoning || data.reason);
+
+        try {
+          chrome.storage.local.get(["autoSolved"]).then(({ autoSolved = 0 }) => {
+            chrome.storage.local.set({
+              autoFailCount: 0,
+              autoSolved: autoSolved + 1,
+            });
+          });
+        } catch (_) {}
+
+        answers.forEach((i) => {
+          const opt = options[i];
+          if (!opt || !opt.radio) return;
+          if (!opt.radio.checked) {
+            opt.radio.click();
+            opt.radio.dispatchEvent(new Event("input", { bubbles: true }));
+            opt.radio.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+        });
+
+        if (autoAdvance) {
+          setTimeout(() => clickXlPrimary(), 500);
+        }
+      }
+    );
+  }
+
+  // Click the XL HTML5 Player's primary action button ("Check answer" before
+  // grading, "Submit" / "Next" after). Picks an enabled `gr-btn-primary`
+  // first, then any enabled button whose label matches.
+  function clickXlPrimary() {
+    const btns = Array.from(document.querySelectorAll("button"));
+    const visible = (b) =>
+      !b.disabled &&
+      !b.classList.contains("hidden") &&
+      b.offsetParent !== null;
+    const labelOf = (b) =>
+      ((b.textContent || "") + " " + (b.getAttribute("aria-label") || "")).trim();
+    const primary = btns.find(
+      (b) =>
+        visible(b) &&
+        /Check answer|Submit|Next/i.test(labelOf(b)) &&
+        (b.classList.contains("gr-btn-primary") ||
+          b.classList.contains("btn-primary"))
+    );
+    if (primary) {
+      primary.click();
+      log("clicked XL primary:", labelOf(primary).slice(0, 40));
+      return true;
+    }
+    const any = btns.find(
+      (b) => visible(b) && /^(Check answer|Submit|Next)$/i.test(labelOf(b))
+    );
+    if (any) {
+      any.click();
+      log("clicked XL fallback:", labelOf(any).slice(0, 40));
+      return true;
+    }
+    log("no XL primary button found");
+    return false;
   }
 
   tryFind();

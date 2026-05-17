@@ -17,7 +17,7 @@
   // -------- inject main-world script ----------------------------------
   try {
     const s = document.createElement("script");
-    s.src = chrome.runtime.getURL("injected.js");
+    s.src = chrome.runtime.getURL("mh-injected.js");
     s.async = false;
     (document.head || document.documentElement).appendChild(s);
     s.onload = () => s.remove();
@@ -91,17 +91,31 @@
     if (rows.length === 0) return [];
     const out = [];
     const usedRows = new Set();
+    // stripWs handles cases where backend HTML (e.g. "H<sub>2</sub>") normalizes
+    // to "h 2" but DOM textContent gives "h2" — compare with whitespace removed.
+    const decodeEntities = (s) => {
+      const d = document.createElement("textarea");
+      d.innerHTML = String(s);
+      return d.value;
+    };
+    const stripWs = (s) => decodeEntities(String(s)).replace(/\s+/g, "");
     for (const want of entry.correctTexts) {
-      // Exact match first
+      const wantNoWs = stripWs(want);
       let hit = rows.find(
         (r) => !usedRows.has(r) && normalizeText(getChoiceText(r)) === want
       );
       if (!hit) {
-        // Substring fallback
         hit = rows.find((r) => {
           if (usedRows.has(r)) return false;
           const norm = normalizeText(getChoiceText(r));
-          return norm.includes(want) || want.includes(norm);
+          const normNoWs = stripWs(norm);
+          return (
+            norm.includes(want) ||
+            want.includes(norm) ||
+            normNoWs === wantNoWs ||
+            normNoWs.includes(wantNoWs) ||
+            wantNoWs.includes(normNoWs)
+          );
         });
       }
       if (hit) {
@@ -279,10 +293,43 @@
     }
     if (solvedThisRender) return;
 
-    const entry = cache.get(stem.norm);
+    let entry = cache.get(stem.norm);
+    if (!entry) {
+      // Fuzzy fallback: if exact stem match fails, look for a cached entry
+      // whose stem overlaps significantly. For FITB (no visible choices),
+      // a 5-word-phrase match is enough. For MC/multi-select, also require
+      // the entry's correctTexts to actually match visible choices on screen
+      // — avoids matching an unrelated question with similar wording.
+      const words = stem.norm.split(" ").filter((w) => w.length > 2);
+      const hasInputs = findFillBlankInputs().length > 0;
+      const visibleChoices = getChoiceRows().map((r) => normalizeText(getChoiceText(r)));
+      // Shorter phrases for FITB (3 words) since stems can be tiny.
+      // MC/multi-select still uses 5 words to avoid false positives.
+      const phraseLen = hasInputs ? 3 : 5;
+      if (words.length >= phraseLen) {
+        for (let i = 0; i <= words.length - phraseLen && !entry; i++) {
+          const phrase = words.slice(i, i + phraseLen).join(" ");
+          for (const [key, val] of cache.entries()) {
+            if (!key.includes(phrase)) continue;
+            if (hasInputs) {
+              // FITB: phrase match is sufficient
+              entry = val;
+              log("fuzzy FITB hit via phrase:", phrase.slice(0, 40));
+              break;
+            }
+            // MC/multi-select: require cached answers to appear in visible choices
+            const answers = (val.correctTexts || []).map((t) => normalizeText(t));
+            if (answers.length && answers.every((a) => visibleChoices.some((c) => c === a || c.includes(a) || a.includes(c)))) {
+              entry = val;
+              log("fuzzy MC hit via phrase:", phrase.slice(0, 40));
+              break;
+            }
+          }
+        }
+      }
+    }
     if (!entry) {
       setStatus("waiting", "Waiting for question data…");
-      maybeAutoRecover(stem.norm);
       return;
     }
 
@@ -362,25 +409,23 @@
 
     if (settings.autoSubmit !== false) {
       const human = settings.humanlike !== false;
-      // Wait a beat after answering. Humanlike: 1.4–3.2s, fixed: 700ms.
-      await sleep(human ? jitter(1400, 3200) : 700);
+      // Humanlike: 1.4–3.2s, fixed: 150ms.
+      await sleep(human ? jitter(1400, 3200) : 150);
       await waitAndClick(
         () => findConfidenceButton(settings.confidence || "high"),
         "confidence",
-        300,
-        20
+        80,
+        25
       );
-      await sleep(human ? jitter(500, 1100) : 400);
+      await sleep(human ? jitter(500, 1100) : 100);
       const sub = findSubmitButton();
       if (sub) {
         sub.click();
         log("submit clicked");
-        await sleep(human ? jitter(400, 900) : 400);
+        await sleep(human ? jitter(400, 900) : 100);
       }
-      // After confidence/submit, Recharge renders the scoring view with
-      // correct/incorrect icons. Poll briefly to read the verdict.
       await checkCorrectness();
-      await waitAndClick(() => findNextButton(), "next", 300, 30);
+      await waitAndClick(() => findNextButton(), "next", 80, 40);
     }
   }
 

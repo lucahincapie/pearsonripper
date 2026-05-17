@@ -179,6 +179,68 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return;
   }
 
+  // ---- Pearson: set Dojo dijit widget value (runs in MAIN world to access window.dijit) ----
+  if (msg.type === "setDijitValue") {
+    const tabId = _sender.tab && _sender.tab.id;
+    const frameId = _sender.frameId;
+    if (!tabId) {
+      sendResponse({ ok: false, error: "no tabId" });
+      return;
+    }
+    chrome.scripting
+      .executeScript({
+        target: { tabId, frameIds: frameId != null ? [frameId] : undefined, allFrames: frameId == null },
+        world: "MAIN",
+        func: (widgetId, value, optionIndex) => {
+          try {
+            // Get the dijit registry — try AMD require first since Pearson uses AMD
+            let registry = null;
+            if (window.require && typeof window.require === "function") {
+              try {
+                const r = window.require("dijit/registry");
+                if (r && r.byId) registry = r;
+              } catch (_) {}
+            }
+            if (!registry && window.dijit && window.dijit.registry) registry = window.dijit.registry;
+            if (!registry && window.dijit && window.dijit.byId) registry = window.dijit;
+            if (!registry || !registry.byId) return { ok: false, reason: "no registry" };
+
+            const w = registry.byId(widgetId);
+            if (!w) return { ok: false, reason: "no widget" };
+
+            // xl.player.controls.Fillin — set selectedIndex (the real state field)
+            // plus value, then notify the controls/grading system.
+            try {
+              if (typeof w.set === "function") {
+                w.set("selectedIndex", optionIndex);
+                try { w.set("value", value); } catch (_) {}
+              } else {
+                w.selectedIndex = optionIndex;
+              }
+              // Notify the grading framework
+              try { if (typeof w.updateControlState === "function") w.updateControlState(); } catch (_) {}
+              try { if (typeof w.answeredCommand === "function") w.answeredCommand(); } catch (_) {}
+              try { if (typeof w.answerAppliedCommand === "function") w.answerAppliedCommand(); } catch (_) {}
+              // Verify selection took
+              const got = w.selectedIndex;
+              return { ok: true, method: "selectedIndex", selectedIndex: got };
+            } catch (e) {
+              return { ok: false, reason: "set failed: " + e.message };
+            }
+          } catch (e) {
+            return { ok: false, reason: String(e.message || e) };
+          }
+        },
+        args: [msg.widgetId, msg.value, msg.optionIndex],
+      })
+      .then((results) => {
+        const r = results && results[0] && results[0].result;
+        sendResponse(r || { ok: false, reason: "no result" });
+      })
+      .catch((e) => sendResponse({ ok: false, error: String(e.message || e) }));
+    return true;
+  }
+
   // ---- Pearson handlers ----
   if (msg.type === "trigger") {
     runSolve(!!msg.autoAdvance);
