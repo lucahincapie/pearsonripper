@@ -851,6 +851,25 @@ function solveInPage(autoAdvance, isAutoMode) {
       }
     }
 
+    // XL HTML5 Player — non-question page (video / reading objective) OR a
+    // graded MC waiting for advance. Both states expose a visible primary
+    // Next button (`command="nextquestion"`). We only skip if there's no
+    // answerable widget on the page: if Check answer is enabled, the MC
+    // detection above already handled it; if Check answer is missing or
+    // disabled and Next is enabled, this page has nothing to solve.
+    const xlNext = document.querySelector(
+      'button[command="nextquestion"]:not([disabled])'
+    );
+    if (xlNext && xlNext.offsetParent !== null) {
+      const xlCheck = document.querySelector(
+        'button[command="checkanswer"]:not([disabled])'
+      );
+      const checkAnswerable = xlCheck && xlCheck.offsetParent !== null;
+      if (!checkAnswerable) {
+        return { kind: "xlSkip", root: xlNext };
+      }
+    }
+
     // Legacy MyLab (mylab.pearson.com) — Dojo xlFillin dropdowns.
     // Detected FIRST since this DOM doesn't have any modern Pearson selectors.
     const legacyDropdowns = Array.from(document.querySelectorAll(".xlFillin"));
@@ -1002,6 +1021,17 @@ function solveInPage(autoAdvance, isAutoMode) {
           try {
             chrome.storage.local.set({ autoMode: false, autoTabId: null });
           } catch (_) {}
+        }
+        return;
+      }
+      if (found.kind === "xlSkip") {
+        log("XL non-question page — clicking Next");
+        if (autoAdvance) {
+          found.root.click();
+          // Player swaps content in-place with no navigation event. Re-poll
+          // so chains of video/reading objectives clear in one trigger.
+          attempts = 0;
+          setTimeout(tryFind, 600);
         }
         return;
       }
