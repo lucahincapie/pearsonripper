@@ -508,11 +508,22 @@ async function runSolve(autoAdvance, tabIdOverride, isAutoMode) {
     tabId = tab.id;
   }
   try {
-    await chrome.scripting.executeScript({
+    const results = await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
       func: solveInPage,
       args: [autoAdvance, !!isAutoMode],
     });
+    // Log per-frame outcome so we can see whether allFrames actually injected
+    // into every frame, including cross-origin ones like tdx.acs.pearson.com.
+    console.log(
+      "[pearson-bot] inject results:",
+      (results || []).map((r) => ({
+        frameId: r.frameId,
+        documentId: r.documentId,
+        ok: r.error == null,
+        error: r.error ? String(r.error.message || r.error) : undefined,
+      }))
+    );
   } catch (e) {
     console.error("[pearson-bot] inject failed", e);
   }
@@ -760,6 +771,20 @@ async function askOpenAI(payload) {
 function solveInPage(autoAdvance, isAutoMode) {
   const log = (...a) => console.log("[pearson-bot]", ...a);
   const isTop = window === window.top;
+  // Each entry claims a fresh ownership token at window scope. Any earlier
+  // solveInPage instance still alive in this frame sees the token has
+  // changed and bails out of its async callbacks — prevents the click-sim
+  // races we get when re-poll + new Solve press + auto-mode all stack up
+  // concurrently in the same iframe.
+  const myToken = Math.random().toString(36) + Date.now();
+  window.__pearsonBotToken = myToken;
+  const isStale = () => window.__pearsonBotToken !== myToken;
+  log(
+    "solveInPage entered in",
+    isTop ? "TOP frame" : "iframe",
+    "@",
+    (location && location.href || "?").slice(0, 100)
+  );
 
   let attempts = 0;
   // Legacy MyLab loads the question inside an iframe at Service/PlayerLaunch.ashx
@@ -769,6 +794,13 @@ function solveInPage(autoAdvance, isAutoMode) {
     !isTop && /Player(Launch|\.aspx)/i.test((location && location.href) || "");
   const maxAttempts = isTop || isXlPlayerFrame ? 25 : 1; // ~7.5s; other subframes bail immediately
   const solvedPartIds = new Set();
+  // Per-question history of LLM picks for XL HTML5 Player MC questions.
+  // Keyed by option fingerprint, value is an array of picked indices in
+  // order. Lets us (a) avoid re-firing the same solve during a re-poll
+  // before grading completes, and (b) tell the LLM "previous pick was
+  // wrong, choose differently" on Pearson's second-attempt ("Final check")
+  // flow. Pearson allows up to 2 attempts, so we cap retries at 2.
+  const xlMcAttempts = new Map();
 
   // Auto-mode kill switch. Only enforced when this run was started by
   // auto mode (Start Auto Mode button). Manual one-shot triggers like
@@ -812,17 +844,183 @@ function solveInPage(autoAdvance, isAutoMode) {
     return any || null;
   }
 
+  // For an XL HTML5 Player multi-part question, pull the textual context
+  // for the part containing the given widget elements:
+  //   - partStem: this part's question stem (e.g. "(d) What can be said...")
+  //   - sentenceTemplate: the visible sentence with widgets replaced by
+  //     [BLANK_N] markers so the LLM sees positional structure
+  //   - previousContext: each prior part's question + the option the player
+  //     marked correct (.correct class on the chosen radio's wrapper).
+  //     This is the case-study scaffolding for later parts.
+  function extractXlStepContext(stepEl, widgetEls) {
+    const result = {
+      partStem: "",
+      sentenceTemplate: "",
+      previousContext: "",
+      problemIntro: "",
+    };
+    const cleanText = (s) =>
+      String(s || "")
+        .replace(/[​-‍﻿]/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+    const widgetSet = new Set(widgetEls);
+
+    // Stem = the first .rvParagraph in this step that doesn't contain a widget
+    const stepParas = Array.from(stepEl.querySelectorAll(":scope > .rvParagraph"));
+    for (const p of stepParas) {
+      if (widgetEls.some((w) => p.contains(w))) continue;
+      const t = cleanText(p.innerText || p.textContent);
+      if (t) {
+        result.partStem = t;
+        break;
+      }
+    }
+
+    // Sentence template = every .rvParagraph in this step that contains at
+    // least one widget, walked in order with each widget replaced by
+    // [BLANK_N]. Multi-blank questions (e.g. vocab-matching across 8
+    // separate sentences) need ALL sentences to be in the prompt, not just
+    // the first one — otherwise the LLM sees one structured sentence + a
+    // pile of bare blanks and gives up after assigning one.
+    const sentParas = Array.from(
+      stepEl.querySelectorAll(".rvParagraph")
+    ).filter((p) => widgetEls.some((w) => p.contains(w)));
+    if (sentParas.length) {
+      const lines = sentParas.map((sentP) => {
+        let out = "";
+        const walk = (node) => {
+          if (node.nodeType === 3) {
+            out += node.textContent;
+            return;
+          }
+          if (node.nodeType !== 1) return;
+          if (widgetSet.has(node)) {
+            out += "[BLANK_" + widgetEls.indexOf(node) + "]";
+            return;
+          }
+          for (const c of node.childNodes) walk(c);
+        };
+        walk(sentP);
+        return cleanText(out);
+      }).filter(Boolean);
+      result.sentenceTemplate = lines.join("\n");
+    }
+
+    // Previous parts in the same problem — siblings before currentStep
+    const parent = stepEl.parentElement;
+    if (parent) {
+      const allSteps = Array.from(parent.querySelectorAll(":scope > span.step"));
+      const idx = allSteps.indexOf(stepEl);
+      const previous = idx > 0 ? allSteps.slice(0, idx) : [];
+      const chunks = [];
+      for (const step of previous) {
+        const qP = step.querySelector(":scope > .rvParagraph");
+        const q = qP ? cleanText(qP.innerText || qP.textContent) : "";
+        // Player marks the chosen-and-correct radio's wrapper with `.correct`.
+        // Fall back to any aria-checked=true if .correct isn't present.
+        const correctRadio =
+          step.querySelector('.dijitRadio.correct input[type="radio"]') ||
+          step.querySelector('input[type="radio"][aria-checked="true"]');
+        const ans = correctRadio
+          ? cleanText(correctRadio.getAttribute("aria-label"))
+          : "";
+        if (q && ans) chunks.push(`${q} — Answer: ${ans}`);
+        else if (q) chunks.push(q);
+      }
+      result.previousContext = chunks.join("\n");
+    }
+
+    // Problem-level intro / stimulus text — the case-study setup that lives
+    // OUTSIDE the contentHolder (which only contains the parts). For the
+    // season-of-birth study this is where Pearson explains what the
+    // researchers found ("…cyclothymic temperament is highest among those
+    // born in summer…"), which is essential to answer parts that ask about
+    // characteristics of each season. Exclude paragraphs inside feedback
+    // dialogs (incorrect-response popups also use `.rvParagraph`).
+    try {
+      const ch = stepEl.closest("#contentHolderbottom, .contentHolder");
+      const introParas = Array.from(document.querySelectorAll(".rvParagraph"))
+        .filter((p) => {
+          if (ch && ch.contains(p)) return false;
+          if (p.closest("[class*='feedback'], [class*='Dialog'], [class*='dialog']"))
+            return false;
+          if (p.offsetParent === null) return false;
+          const r = p.getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) return false;
+          return true;
+        })
+        .map((p) => cleanText(p.innerText || p.textContent))
+        .filter(Boolean);
+      result.problemIntro = introParas.join("\n\n");
+    } catch (_) {}
+
+    return result;
+  }
+
+  let __findStuffSnapshotLogged = false;
+  let __xlFillinFilterLogged = false;
   function findStuff() {
+    if (!__findStuffSnapshotLogged) {
+      __findStuffSnapshotLogged = true;
+      try {
+        log(
+          "findStuff first-call snapshot —",
+          "xlFillin:", document.querySelectorAll(".xlFillin").length,
+          "MC:", document.querySelectorAll('[widgetid^="xl_player_controls__MultipleChoiceAnswerButton_"]').length,
+          "openParts:", document.querySelectorAll(".sections .section.part.foldy.open").length,
+          "checkBtn:", !!document.querySelector('button[command="checkanswer"]:not([disabled])'),
+          "nextBtn:", !!document.querySelector('button[command="nextquestion"]:not([disabled]),button[data-dojo-attach-point="btnNextQuestion"]:not([disabled])')
+        );
+      } catch (_) {}
+    }
+    // XL HTML5 Player feedback dialog (incorrect-response popup or similar).
+    // Pearson blocks the page until the user dismisses it via OK. Detect
+    // FIRST so we clear modals before any other detection logic.
+    const feedbackDialog = document.querySelector(
+      ".feedbackDialog.dijitDialog, [class*='feedbackDialog']"
+    );
+    if (feedbackDialog && feedbackDialog.offsetParent !== null) {
+      const okBtn =
+        feedbackDialog.querySelector(
+          '[data-dojo-attach-point="btnOk"]:not([disabled])'
+        ) ||
+        Array.from(feedbackDialog.querySelectorAll("button")).find(
+          (b) =>
+            !b.disabled &&
+            b.offsetParent !== null &&
+            /^(OK|Continue)$/i.test((b.textContent || "").trim())
+        );
+      if (okBtn && okBtn.offsetParent !== null) {
+        return { kind: "xlOk", root: okBtn };
+      }
+    }
+
     // Legacy MyLab XL HTML5 Player — multiple choice. Lives in an iframe at
     // Service/PlayerLaunch.ashx / Player.aspx and renders Dojo dijit widgets
     // with widgetid="xl_player_controls__MultipleChoiceAnswerButton_N", each
     // wrapping an <input type="radio"> whose aria-label is "A. <choice text>".
-    // Detected here because the legacy DOM lacks modern Pearson selectors.
+    // The player KEEPS OLD PART WIDGETS in the DOM as the user advances
+    // through multi-part questions — some hidden, but graded parts stay
+    // VISIBLE above the current part (read-only). Filter on both:
+    //   - currently rendered (offsetParent, non-zero rect)
+    //   - radio not disabled / aria-disabled (graded radios go disabled)
+    // Otherwise the LLM sees option soup spanning 2+ parts concatenated.
+    const isAnswerableXlBtn = (btn) => {
+      if (!btn || btn.offsetParent === null) return false;
+      const r = btn.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) return false;
+      const radio = btn.querySelector('input[type="radio"]');
+      if (!radio) return false;
+      if (radio.disabled) return false;
+      if (radio.getAttribute("aria-disabled") === "true") return false;
+      return true;
+    };
     const xlMcButtons = Array.from(
       document.querySelectorAll(
         '[widgetid^="xl_player_controls__MultipleChoiceAnswerButton_"]'
       )
-    );
+    ).filter(isAnswerableXlBtn);
     if (xlMcButtons.length) {
       const options = xlMcButtons
         .map((btn, idx) => {
@@ -839,58 +1037,172 @@ function solveInPage(autoAdvance, isAutoMode) {
         })
         .filter((o) => o.radio);
       if (options.length) {
-        // Walk up from the first option to find the MultipleChoice widget
-        // container — it holds the question stem alongside the option buttons.
-        const container =
-          xlMcButtons[0].closest(
-            '[widgetid^="xl_player_controls_MultipleChoice"]:not([widgetid*="Answer"])'
-          ) ||
-          xlMcButtons[0].closest(".dijitContentPane") ||
-          document.body;
-        return { kind: "xlMc", root: container, qEl: container, options };
-      }
-    }
-
-    // XL HTML5 Player — non-question page (video / reading objective) OR a
-    // graded MC waiting for advance. Both states expose a visible primary
-    // Next button (`command="nextquestion"`). We only skip if there's no
-    // answerable widget on the page: if Check answer is enabled, the MC
-    // detection above already handled it; if Check answer is missing or
-    // disabled and Next is enabled, this page has nothing to solve.
-    const xlNext = document.querySelector(
-      'button[command="nextquestion"]:not([disabled])'
-    );
-    if (xlNext && xlNext.offsetParent !== null) {
-      const xlCheck = document.querySelector(
-        'button[command="checkanswer"]:not([disabled])'
-      );
-      const checkAnswerable = xlCheck && xlCheck.offsetParent !== null;
-      if (!checkAnswerable) {
-        return { kind: "xlSkip", root: xlNext };
+        // Fingerprint by option letters + text prefixes. Used to (a) avoid
+        // racing re-polls before grading completes and (b) feed prior
+        // attempts back to the LLM when Pearson offers a second try.
+        const optionKey = options
+          .map((o) => o.letter + ":" + o.text.slice(0, 40))
+          .join("|");
+        const previousPicks = xlMcAttempts.get(optionKey) || [];
+        // Pearson allows up to 2 attempts per MC. After both, fall through
+        // to xlSkip so we advance to whatever comes next.
+        if (previousPicks.length < 2) {
+          // Walk up from the first option to find the MultipleChoice widget
+          // container — it holds the question stem alongside the buttons.
+          const container =
+            xlMcButtons[0].closest(
+              '[widgetid^="xl_player_controls_MultipleChoice"]:not([widgetid*="Answer"])'
+            ) ||
+            xlMcButtons[0].closest(".dijitContentPane") ||
+            document.body;
+          return {
+            kind: "xlMc",
+            root: container,
+            qEl: container,
+            options,
+            optionKey,
+            previousPicks,
+          };
+        }
+        // Out of attempts — fall through to xlSkip so we click Next.
       }
     }
 
     // Legacy MyLab (mylab.pearson.com) — Dojo xlFillin dropdowns.
-    // Detected FIRST since this DOM doesn't have any modern Pearson selectors.
-    const legacyDropdowns = Array.from(document.querySelectorAll(".xlFillin"));
+    // Detected after XL MC / xlSkip so multi-part questions whose later
+    // parts are dropdowns route here once the MC parts are filtered out.
+    // Graded dropdowns from earlier wrong attempts stay VISIBLE alongside
+    // the new similar-exercise dropdowns, so we must also filter on the
+    // disabled signals — otherwise the bot fills 4 widgets when only 2 are
+    // active, the LLM picks 4 values, and Check answer never enables.
+    const isAnswerableXlFillin = (el) => {
+      if (el.offsetParent === null) return false;
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) return false;
+      if (el.classList.contains("dijitDisabled")) return false;
+      const trigger = el.querySelector(".xlFillinItem");
+      if (trigger) {
+        if (trigger.getAttribute("aria-disabled") === "true") return false;
+        if (trigger.classList.contains("dijitDisabled")) return false;
+        // Already has a value displayed → user (or the bot) has answered
+        // this dropdown. Skipping prevents the post-Check-answer re-poll
+        // from re-submitting the same question. Pearson's display span sits
+        // next to the .xlFillinArrow inside the trigger.
+        const display = trigger.querySelector(
+          "span:not(.xlFillinArrow):not([role])"
+        );
+        if (display) {
+          const text = (display.textContent || "")
+            .replace(/[ ​]/g, "")
+            .trim();
+          if (text) return false;
+        }
+      }
+      return true;
+    };
+    const allFillins = Array.from(document.querySelectorAll(".xlFillin"));
+    const legacyDropdowns = allFillins.filter(isAnswerableXlFillin);
+    if (allFillins.length !== legacyDropdowns.length && !__xlFillinFilterLogged) {
+      __xlFillinFilterLogged = true;
+      log(
+        "xlFillin: filtered out",
+        allFillins.length - legacyDropdowns.length,
+        "graded/disabled of",
+        allFillins.length
+      );
+    }
     if (legacyDropdowns.length > 0) {
       const blanks = legacyDropdowns
         .map((el) => {
-          const sentence = el.getAttribute("ariadescription") || el.getAttribute("arialabel") || "";
-          const options = Array.from(el.querySelectorAll(".xlFillinContainer > div")).map((o) => ({
-            text: (o.textContent || "").trim(),
-            el: o,
-          }));
-          return { el, sentence, options };
+          const widgetId = el.getAttribute("widgetid") || "";
+          // The arialabel/ariadescription attributes live on the INNER
+          // `.xlFillinItem` trigger, not the outer `.xlFillin` wrapper. The
+          // outer has no aria attrs, so reading from `el` always returned
+          // empty — leaving the LLM blind to what each blank is asking.
+          const trigger = el.querySelector(".xlFillinItem");
+          const sentence =
+            (trigger &&
+              (trigger.getAttribute("ariadescription") ||
+                trigger.getAttribute("arialabel"))) ||
+            "";
+          // Options live in one of two places:
+          //   1. Legacy MyLab: direct child divs of `.xlFillinContainer`
+          //   2. XL HTML5 Player: a separate Dojo menu popup at
+          //      `#${widgetId}_menu` containing <tr id="${widgetId}-N">
+          //      rows. Skip the `_blank` placeholder row (different id format
+          //      so the prefix selector excludes it automatically).
+          // Fresh untouched dropdowns may have NEITHER yet — the menu DOM
+          // only gets attached after the trigger is opened at least once.
+          // We accept those blanks and defer option discovery to
+          // doDropdownsSolve (which clicks the trigger first).
+          let optionEls = [];
+          if (widgetId) {
+            const menu = document.getElementById(widgetId + "_menu");
+            if (menu) {
+              optionEls = Array.from(
+                menu.querySelectorAll('tr[id^="' + widgetId + '-"]')
+              );
+            }
+          }
+          if (optionEls.length === 0) {
+            optionEls = Array.from(el.querySelectorAll(".xlFillinContainer > div"));
+          }
+          const options = optionEls.map((o) => {
+            const label = o.querySelector(".dijitMenuItemLabel");
+            return {
+              text: ((label && label.textContent) || o.textContent || "")
+                .replace(/\s+/g, " ")
+                .trim(),
+              el: o,
+            };
+          });
+          return { el, sentence, options, widgetId };
         })
-        .filter((b) => b.options.length > 0);
+        // Keep widgets with no options yet — solver will populate via trigger.
+        // But only if it's a known Pearson dropdown shape (the .xlFillinItem
+        // trigger exists), to avoid picking up empty container shells.
+        .filter((b) => b.options.length > 0 || b.el.querySelector(".xlFillinItem"));
       if (blanks.length > 0) {
         const qEl =
           document.querySelector(".contentHolder") ||
           document.querySelector("#full") ||
           document.body;
-        return { kind: "dropdowns", root: qEl, qEl, blanks };
+        // For multi-part XL Player questions, pull the current part's stem,
+        // the sentence template with blank markers, and the Q+A of previous
+        // already-graded parts as case-study context. Empty strings for
+        // legacy MyLab without the `<span class="step">` part structure.
+        const currentStep = blanks[0].el.closest("span.step");
+        const stepCtx = currentStep
+          ? extractXlStepContext(currentStep, blanks.map((b) => b.el))
+          : { partStem: "", sentenceTemplate: "", previousContext: "" };
+        return {
+          kind: "dropdowns",
+          root: qEl,
+          qEl,
+          blanks,
+          partStem: stepCtx.partStem,
+          sentenceTemplate: stepCtx.sentenceTemplate,
+          previousContext: stepCtx.previousContext,
+          problemIntro: stepCtx.problemIntro,
+        };
       }
+    }
+
+    // XL HTML5 Player — non-question page (video / reading objective) OR a
+    // post-grade state waiting for advance. The XL Player has two Next
+    // buttons:
+    //   - `command="nextquestion"` on video/reading pages and assignment overview
+    //   - `data-dojo-attach-point="btnNextQuestion"` rendered AFTER an MC or
+    //     dropdown question is graded (text "Next question")
+    // We reach this branch only when no answerable XL widget exists (the
+    // earlier xlMc and xlFillin paths would have returned). At this point,
+    // a visible Next button means it's safe to click.
+    const xlNext = document.querySelector(
+      'button[command="nextquestion"]:not([disabled]),' +
+      'button[data-dojo-attach-point="btnNextQuestion"]:not([disabled])'
+    );
+    if (xlNext && xlNext.offsetParent !== null) {
+      return { kind: "xlSkip", root: xlNext };
     }
 
     const picked = pickOpenPart();
@@ -999,6 +1311,11 @@ function solveInPage(autoAdvance, isAutoMode) {
   }
 
   async function tryFind() {
+    if (isStale()) {
+      // A newer solveInPage instance has taken over this frame; stop the
+      // older one's retry chain so we don't race on the DOM.
+      return;
+    }
     if (!(await autoStillOn())) {
       log("auto mode off — stopping");
       return;
@@ -1032,6 +1349,18 @@ function solveInPage(autoAdvance, isAutoMode) {
           // so chains of video/reading objectives clear in one trigger.
           attempts = 0;
           setTimeout(tryFind, 600);
+        }
+        return;
+      }
+      if (found.kind === "xlOk") {
+        log("XL feedback dialog — clicking OK");
+        if (autoAdvance) {
+          found.root.click();
+          // Dialog dismisses to either the graded current question or a
+          // brand-new (often "similar exercise") question. Re-poll so the
+          // bot picks up whichever appears next.
+          attempts = 0;
+          setTimeout(tryFind, 800);
         }
         return;
       }
@@ -2122,13 +2451,88 @@ function solveInPage(autoAdvance, isAutoMode) {
 
   // Legacy MyLab xlFillin dropdowns solver
   async function doDropdownsSolve(found) {
-    const { blanks } = found;
-    const questionText =
-      "Select the correct choice for each blank in the sentences below.";
-    const blankDescs = blanks.map((b, i) => {
-      const opts = b.options.map((o, j) => `${j}. ${o.text}`).join(" | ");
-      return `Blank ${i}: "____ ${b.sentence}" — Options: ${opts}`;
-    });
+    if (isStale()) return;
+    const { blanks, partStem, sentenceTemplate, previousContext, problemIntro } = found;
+
+    // Fresh untouched XL Player dropdowns don't have their Dojo popup menu
+    // attached yet (`#${widgetId}_menu` doesn't exist) — Pearson only
+    // attaches it after the trigger is opened at least once. For any blank
+    // with no options yet, click its trigger to attach the menu, read the
+    // options into blank.options, then close (Escape) so the menu doesn't
+    // stay visible during the LLM call.
+    for (const blank of blanks) {
+      if (blank.options.length > 0) continue;
+      const trigger = blank.el.querySelector(".xlFillinItem");
+      if (!trigger) continue;
+      trigger.focus();
+      trigger.click();
+      await new Promise((r) => setTimeout(r, 350));
+      const widgetId = blank.widgetId || blank.el.getAttribute("widgetid");
+      const menu = widgetId && document.getElementById(widgetId + "_menu");
+      if (menu) {
+        const optionEls = Array.from(
+          menu.querySelectorAll('tr[id^="' + widgetId + '-"]')
+        );
+        blank.options = optionEls.map((o) => {
+          const label = o.querySelector(".dijitMenuItemLabel");
+          return {
+            text: ((label && label.textContent) || o.textContent || "")
+              .replace(/\s+/g, " ")
+              .trim(),
+            el: o,
+          };
+        });
+        log("populated options for " + widgetId + ":", blank.options.length);
+      } else {
+        log("trigger-open did not produce a menu for " + widgetId);
+      }
+      // Dismiss the menu so it doesn't visually linger.
+      try {
+        document.body.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "Escape", code: "Escape", keyCode: 27, bubbles: true })
+        );
+      } catch (_) {}
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    // Drop any blank that still has no options — we can't ask the LLM to
+    // pick from nothing, and proceeding would assign random indexes.
+    const usableBlanks = blanks.filter((b) => b.options.length > 0);
+    if (usableBlanks.length === 0) {
+      log("dropdowns: no options discovered for any blank, aborting");
+      return;
+    }
+    if (usableBlanks.length !== blanks.length) {
+      log("dropdowns: " + (blanks.length - usableBlanks.length) + " blank(s) without options were dropped");
+    }
+    // Rewrite the live blanks array in place so the rest of the function
+    // (which closes over `blanks`) sees the filtered list.
+    blanks.length = 0;
+    Array.prototype.push.apply(blanks, usableBlanks);
+    // When XL Player multi-part context is available, build a rich question
+    // with the case-study scaffolding (problem intro / study setup, previous
+    // parts' Q+A, the current part's stem, and the sentence template with
+    // [BLANK_N] markers). Otherwise fall back to legacy generic prompt.
+    let questionText;
+    if (partStem || sentenceTemplate) {
+      questionText =
+        (problemIntro
+          ? `Problem setup / case study:\n${problemIntro}\n\n`
+          : "") +
+        (previousContext
+          ? `Previous parts of this problem (already answered correctly):\n${previousContext}\n\n`
+          : "") +
+        (partStem ? `Current part question: ${partStem}\n\n` : "") +
+        (sentenceTemplate
+          ? `Fill the blanks to complete this sentence:\n${sentenceTemplate}`
+          : "Select the correct choice for each blank in the sentence.");
+      log("dropdowns: using XL multi-part context");
+      if (problemIntro) log("  intro:", problemIntro.slice(0, 200));
+      if (previousContext) log("  prev parts:", previousContext.slice(0, 200));
+      if (partStem) log("  stem:", partStem);
+      if (sentenceTemplate) log("  template:", sentenceTemplate);
+    } else {
+      questionText = "Select the correct choice for each blank in the sentences below.";
+    }
     const payload = {
       kind: "dropdowns",
       question: questionText,
@@ -2144,6 +2548,10 @@ function solveInPage(autoAdvance, isAutoMode) {
       resp = await chrome.runtime.sendMessage({ type: "askLLM", payload });
     } catch (e) {
       log("askLLM failed:", e);
+      return;
+    }
+    if (isStale()) {
+      log("doDropdownsSolve: stale after LLM response, aborting");
       return;
     }
     if (!resp || !resp.ok) {
@@ -2213,60 +2621,176 @@ function solveInPage(autoAdvance, isAutoMode) {
           });
           if (resp && resp.ok) {
             dijitSet = true;
-            log("dropdown blank " + a.blank + " → " + option.text + " (" + (resp.method || "dijit") + ")");
+            log(
+              "dropdown blank " + a.blank + " → " + option.text +
+                " (" + (resp.method || "dijit") + ")" +
+                " isEmpty=" + resp.isEmpty + " response=" + resp.response
+            );
+            if (resp.menuClickError) log("  menuItemClicked error:", resp.menuClickError);
           } else {
             log("dijit set failed:", resp && (resp.reason || resp.error));
           }
         }
       } catch (e) { log("dijit msg error:", e.message); }
 
-      if (!dijitSet) {
-        // Click trigger to open the menu table, then click the option row
-        const trigger = blank.el.querySelector(".xlFillinItem");
-        const widgetId = blank.el.getAttribute("widgetid") || (trigger && trigger.id);
-        if (trigger) {
-          trigger.focus();
-          // Use native .click() — sometimes triggers Dojo even if dispatchEvent doesn't
-          trigger.click();
-          fireMouseEvents(trigger);
-          await new Promise((r) => setTimeout(r, 400));
+      // ALWAYS simulate the real user click sequence — open the menu by
+      // clicking the trigger, then click the option div. This is what fires
+      // the widget's own _onChange handler, which is what notifies Pearson's
+      // parent widget that the dropdown was answered. The dijit selectedIndex
+      // set alone updates internal state and rerenders the display but
+      // doesn't fire _onChange, so Check answer stays disabled.
+      // Menu options can be <tr> (legacy popup) or <div> (XL HTML5 Player
+      // inline list with id `${widgetId}-${idx}`).
+      const trigger = blank.el.querySelector(".xlFillinItem");
+      const widgetId = blank.el.getAttribute("widgetid") || (trigger && trigger.id);
+      if (trigger) {
+        trigger.focus();
+        trigger.click();
+        fireMouseEvents(trigger);
+        await new Promise((r) => setTimeout(r, 600));
+      }
+      const menuRowId = widgetId + "-" + a.option;
+      // Prefer the popup <tr> over the inline <div> with the same id — only
+      // the popup row has a click handler that fires Dojo's selection event.
+      const menu = document.getElementById(widgetId + "_menu");
+      let menuRow = null;
+      if (menu) {
+        menuRow = menu.querySelector('[id="' + menuRowId + '"]');
+      }
+      if (!menuRow) {
+        menuRow = document.querySelector('tr[id="' + menuRowId + '"]');
+      }
+      if (!menuRow) {
+        menuRow = document.getElementById(menuRowId);
+      }
+      if (menuRow) {
+        menuRow.click();
+        fireMouseEvents(menuRow);
+        log("dropdown blank " + a.blank + " → " + option.text + " (clicked)");
+      } else {
+        const availIds = Array.from(blank.el.querySelectorAll(".xlFillinContainer > div"))
+          .map((d) => d.id)
+          .filter(Boolean)
+          .join(", ");
+        log("dropdown blank " + a.blank + " → menu row " + menuRowId + " not found; available: " + availIds);
+      }
+      // Also fire input/change/blur on the hidden focusNode as belt-and-suspenders
+      // in case the widget routes commit through there.
+      const focusNode = blank.el.querySelector('input[data-dojo-attach-point="focusNode"]');
+      if (focusNode) {
+        try {
+          const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+          setter.call(focusNode, option.text);
+        } catch (_) {
+          focusNode.value = option.text;
         }
-        // The opened menu is a table with id `${widgetId}_menu`; rows are `${widgetId}-${idx}`
-        const menuRowId = widgetId + "-" + a.option;
-        let menuRow = document.querySelector("tr#" + CSS.escape(menuRowId));
+        focusNode.dispatchEvent(new Event("input", { bubbles: true }));
+        focusNode.dispatchEvent(new Event("change", { bubbles: true }));
+        focusNode.dispatchEvent(new Event("blur", { bubbles: true }));
+      }
+      // Manually update the visible display text in the trigger. For fresh
+      // widgets that haven't been opened yet, Dojo's display-update side
+      // effect doesn't always fire from dijit.set("selectedIndex"). Writing
+      // the text directly to the display span ensures the UI reflects the
+      // pick AND the post-fill verify reads a non-empty display.
+      const displaySpan =
+        trigger && trigger.querySelector("span:not(.xlFillinArrow):not([role])");
+      if (displaySpan) displaySpan.textContent = option.text;
+      // Update the hidden aria-label node text (kept hidden — it's an
+      // accessibility-only element that mirrors the selection for screen
+      // readers; making it visible duplicates the value under each box).
+      const ariaLabelNode = blank.el.querySelector(".xlFillinInputValueAriaLabelNode");
+      if (ariaLabelNode) ariaLabelNode.textContent = option.text;
+      await new Promise((r) => setTimeout(r, 600));
+    }
+
+    // Verify each blank and retry once for any that didn't commit. The
+    // second iteration's click-sim sometimes fails — the previous trigger's
+    // lingering popup state can suppress the next menu's selection. One
+    // retry per failed blank consistently fixes it.
+    await new Promise((r) => setTimeout(r, 300));
+    const NBSP = /[ ​]/g;
+    const getDisplay = (blank) => {
+      const trigger = blank.el && blank.el.querySelector(".xlFillinItem");
+      const display = trigger && trigger.querySelector("span:not(.xlFillinArrow):not([role])");
+      return display ? (display.textContent || "").replace(NBSP, "").trim() : "";
+    };
+    let allCommitted = true;
+    for (const a of assignments) {
+      const blank = blanks[a.blank];
+      if (!blank) continue;
+      const widgetId = blank.widgetId || blank.el.getAttribute("widgetid");
+      let text = getDisplay(blank);
+      if (text) {
+        log("post-fill verify: " + widgetId + " display=" + JSON.stringify(text));
+        continue;
+      }
+      log("post-fill verify: " + widgetId + " EMPTY — retrying click sim");
+      const option = blank.options[a.option];
+      const trigger = blank.el.querySelector(".xlFillinItem");
+      if (trigger && option) {
+        trigger.focus();
+        trigger.click();
+        fireMouseEvents(trigger);
+        await new Promise((r) => setTimeout(r, 600));
+        const menuRow =
+          document.getElementById(widgetId + "-" + a.option) ||
+          document.querySelector("tr#" + CSS.escape(widgetId + "-" + a.option));
         if (menuRow) {
           menuRow.click();
           fireMouseEvents(menuRow);
         }
-
-        // ALSO directly write into the focusNode + display span as a fallback,
-        // in case Dojo's listener won't fire for synthetic events
-        const focusNode = blank.el.querySelector('input[data-dojo-attach-point="focusNode"]');
-        if (focusNode) {
-          const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
-          setter.call(focusNode, option.text);
-          focusNode.dispatchEvent(new Event("input", { bubbles: true }));
-          focusNode.dispatchEvent(new Event("change", { bubbles: true }));
-        }
-        // Update displayed text
-        const displaySpan =
-          trigger && trigger.querySelector("span:not(.xlFillinArrow):not([role])");
-        if (displaySpan) displaySpan.textContent = option.text;
-        log("dropdown blank " + a.blank + " → " + option.text + " (forced)");
+        await new Promise((r) => setTimeout(r, 500));
       }
-      await new Promise((r) => setTimeout(r, 400));
+      text = getDisplay(blank);
+      if (text) {
+        log("retry succeeded: " + widgetId + " display=" + JSON.stringify(text));
+      } else {
+        log("retry failed: " + widgetId + " still EMPTY");
+        allCommitted = false;
+      }
+    }
+    if (!allCommitted) {
+      log("dropdowns: not all blanks committed — Check answer likely stays disabled");
     }
 
-    // Click Check answer
+    // Click Check answer. Pearson may take a beat after the value events to
+    // enable the button — poll for up to ~3s before giving up.
     await new Promise((r) => setTimeout(r, 500));
-    const checkBtn =
-      document.querySelector('button[command="checkanswer"]:not([disabled])') ||
-      document.querySelector('button[command="checkanswer"]');
-    if (checkBtn && !checkBtn.disabled) {
-      checkBtn.click();
-      log("clicked Check answer");
-    } else {
-      log("Check answer button not enabled");
+    let clicked = false;
+    for (let i = 0; i < 10 && !clicked; i++) {
+      const checkBtn =
+        document.querySelector('button[command="checkanswer"]:not([disabled])') ||
+        // XL HTML5 Player's primary action button (no `command` attribute on
+        // some pages — just the primary class + "Check answer" label).
+        Array.from(document.querySelectorAll("button")).find(
+          (b) =>
+            !b.disabled &&
+            !b.classList.contains("hidden") &&
+            b.offsetParent !== null &&
+            /Check answer|Submit/i.test((b.textContent || "").trim()) &&
+            (b.classList.contains("gr-btn-primary") ||
+              b.classList.contains("btn-primary"))
+        );
+      if (checkBtn) {
+        checkBtn.click();
+        log("clicked Check answer");
+        clicked = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    if (!clicked) log("Check answer button never enabled");
+
+    // Re-poll after Pearson grades so the bot picks up whatever appears
+    // next: the OK feedback dialog, a Next-question button, or a fresh
+    // dropdown/MC question. Pearson swaps content in-place; no navigation
+    // event would otherwise re-trigger detection.
+    if (clicked && autoAdvance) {
+      setTimeout(() => {
+        attempts = 0;
+        tryFind();
+      }, 2500);
     }
   }
 
@@ -2668,8 +3192,10 @@ function solveInPage(autoAdvance, isAutoMode) {
   // but clicks the Dojo radio inputs directly and submits via the player's
   // "Check answer" primary button instead of the modern player's
   // `span.answer-button.submit`.
-  async function doXlMcSolve({ root, qEl, options }) {
+  async function doXlMcSolve({ root, qEl, options, optionKey, previousPicks }) {
+    if (isStale()) return;
     const choices = options.map((o, i) => o.text || `[choice ${i + 1}]`);
+    const isRetry = previousPicks && previousPicks.length > 0;
 
     // The container's text contains the prompt AND the option labels.
     // Strip out each option's "<letter>. <text>" and "<text>" so what's
@@ -2693,15 +3219,24 @@ function solveInPage(autoAdvance, isAutoMode) {
     const mainCtx = await fetchMainWorldContext();
     const subject = buildSubjectString(mainCtx && mainCtx.meta);
 
+    const retryNote = isRetry
+      ? "\n\nIMPORTANT: This is a second attempt. The following choice index" +
+        (previousPicks.length > 1 ? "es were" : " was") +
+        " already tried and graded INCORRECT: " +
+        previousPicks.map((i) => i + " (" + (choices[i] || "?") + ")").join(", ") +
+        ". Pick a DIFFERENT index this time."
+      : "";
     const fullQuestion =
       stem +
       (imageDescriptions.length
         ? "\n\nImage descriptions:\n- " + imageDescriptions.join("\n- ")
-        : "");
+        : "") +
+      retryNote;
 
     log("XL MC Q:", stem.slice(0, 100));
     log("choices:", choices);
     log("subject:", subject || "(none)");
+    if (isRetry) log("RETRY — previous picks:", previousPicks);
 
     chrome.runtime.sendMessage(
       {
@@ -2717,6 +3252,10 @@ function solveInPage(autoAdvance, isAutoMode) {
         },
       },
       (resp) => {
+        if (isStale()) {
+          log("doXlMcSolve: stale after LLM response, aborting");
+          return;
+        }
         if (!resp || !resp.ok) {
           console.error("[pearson-bot] LLM error:", resp && resp.error);
           return;
@@ -2728,6 +3267,19 @@ function solveInPage(autoAdvance, isAutoMode) {
           .filter((n) => Number.isInteger(n) && n >= 0 && n < options.length);
 
         log("picked:", answers, "reason:", data.reasoning || data.reason);
+
+        // Record this attempt against the optionKey so a wrong-answer
+        // re-detection can retry with a different choice (and so the same
+        // question can't be re-solved infinitely if grading is slow).
+        if (optionKey && answers.length > 0) {
+          const tries = xlMcAttempts.get(optionKey) || [];
+          // If the LLM picked an already-tried index (rare but possible),
+          // don't double-record — but still record at least one new entry
+          // to advance the attempt counter.
+          if (!tries.includes(answers[0])) tries.push(answers[0]);
+          else tries.push(answers[0]);
+          xlMcAttempts.set(optionKey, tries);
+        }
 
         try {
           chrome.storage.local.get(["autoSolved"]).then(({ autoSolved = 0 }) => {
@@ -2750,6 +3302,15 @@ function solveInPage(autoAdvance, isAutoMode) {
 
         if (autoAdvance) {
           setTimeout(() => clickXlPrimary(), 500);
+          // Pearson takes ~1-2s to grade. After that the player swaps in
+          // a "Next question" button (data-dojo-attach-point="btnNextQuestion"
+          // — different from the command="nextquestion" Next on video/reading
+          // pages). Re-fire tryFind so xlSkip catches it and chains onward.
+          // Player swaps content in-place, so no navigation event fires.
+          setTimeout(() => {
+            attempts = 0;
+            tryFind();
+          }, 2500);
         }
       }
     );
@@ -2766,10 +3327,12 @@ function solveInPage(autoAdvance, isAutoMode) {
       b.offsetParent !== null;
     const labelOf = (b) =>
       ((b.textContent || "") + " " + (b.getAttribute("aria-label") || "")).trim();
+    // Match Check answer / Final check / Submit / Next / Continue. "Final
+    // check" appears on the second attempt after a wrong first answer.
     const primary = btns.find(
       (b) =>
         visible(b) &&
-        /Check answer|Submit|Next/i.test(labelOf(b)) &&
+        /check|submit|next|continue/i.test(labelOf(b)) &&
         (b.classList.contains("gr-btn-primary") ||
           b.classList.contains("btn-primary"))
     );
@@ -2779,7 +3342,9 @@ function solveInPage(autoAdvance, isAutoMode) {
       return true;
     }
     const any = btns.find(
-      (b) => visible(b) && /^(Check answer|Submit|Next)$/i.test(labelOf(b))
+      (b) =>
+        visible(b) &&
+        /^(Check answer|Final check|Submit|Next|Continue)$/i.test(labelOf(b))
     );
     if (any) {
       any.click();
@@ -2790,5 +3355,10 @@ function solveInPage(autoAdvance, isAutoMode) {
     return false;
   }
 
-  tryFind();
+  // Surface any silent async rejection from tryFind so we don't get a
+  // dead-frame mystery — findStuff exceptions otherwise vanish into the
+  // unhandled-promise void.
+  Promise.resolve()
+    .then(() => tryFind())
+    .catch((e) => log("tryFind rejected:", e && (e.message || String(e))));
 }

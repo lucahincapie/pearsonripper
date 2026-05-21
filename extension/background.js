@@ -208,22 +208,111 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             const w = registry.byId(widgetId);
             if (!w) return { ok: false, reason: "no widget" };
 
-            // xl.player.controls.Fillin — set selectedIndex (the real state field)
-            // plus value, then notify the controls/grading system.
+            // xl.player.controls.Fillin tracks answered state with isEmpty
+            // and response (not selectedIndex/value, which only control the
+            // display). Pearson's Check-answer enable logic reads isEmpty.
+            // The canonical commit entry is menuItemClicked(node) — that's
+            // what flips isEmpty=false, response=index, and notifies the
+            // parent so Check answer re-evaluates.
             try {
+              // 1. Set display state via the standard Dojo path
               if (typeof w.set === "function") {
                 w.set("selectedIndex", optionIndex);
                 try { w.set("value", value); } catch (_) {}
               } else {
                 w.selectedIndex = optionIndex;
               }
-              // Notify the grading framework
+
+              // 2. Call menuItemClicked() — the canonical commit entry on
+              //    xl.player.controls.Fillin. Pearson's popup `<tr>` rows
+              //    in `#${widgetId}_menu` only exist after the dropdown has
+              //    been opened at least once, so we trigger toggleMenu()
+              //    first if the popup isn't there yet.
+              let menuClickFired = false;
+              let menuClickError = null;
+              try {
+                if (typeof w.menuItemClicked === "function") {
+                  // Ensure the popup menu exists. toggleMenu opens (or
+                  // closes if already open) — first call materializes the
+                  // popup table at body level.
+                  let popup = document.getElementById(widgetId + "_menu");
+                  if (!popup && typeof w.toggleMenu === "function") {
+                    try { w.toggleMenu(); } catch (_) {}
+                    popup = document.getElementById(widgetId + "_menu");
+                  }
+
+                  let node = null;
+                  if (popup) {
+                    node = popup.querySelector('[id="' + widgetId + '-' + optionIndex + '"]');
+                  }
+                  if (!node && w._getItemNode) {
+                    try {
+                      node = w._getItemNode(optionIndex);
+                    } catch (_) {}
+                  }
+                  if (!node) {
+                    node = document.getElementById(widgetId + "-" + optionIndex);
+                  }
+
+                  if (node) {
+                    try {
+                      w.menuItemClicked(node);
+                      menuClickFired = true;
+                    } catch (e1) {
+                      menuClickError = "node arg: " + e1.message;
+                      // Some signatures take the index instead of the node
+                      try {
+                        w.menuItemClicked(optionIndex);
+                        menuClickFired = true;
+                        menuClickError = null;
+                      } catch (e2) {
+                        menuClickError += "; index arg: " + e2.message;
+                      }
+                    }
+                  } else {
+                    menuClickError = "no menu item node found";
+                    // Last resort: try with just the index
+                    try {
+                      w.menuItemClicked(optionIndex);
+                      menuClickFired = true;
+                      menuClickError = null;
+                    } catch (e) {
+                      menuClickError += "; index arg: " + e.message;
+                    }
+                  }
+
+                  // Close the popup we opened (toggleMenu toggles state, so
+                  // a second call closes it).
+                  if (popup && typeof w.toggleMenu === "function") {
+                    try { w.toggleMenu(); } catch (_) {}
+                  }
+                }
+              } catch (e) {
+                menuClickError = "outer: " + e.message;
+              }
+
+              // 3. Belt-and-suspenders: force the answered-state flags
+              //    directly in case menuItemClicked didn't fire or didn't
+              //    update these specific properties.
+              try { w.isEmpty = false; } catch (_) {}
+              try { w.response = optionIndex; } catch (_) {}
+
+              // 4. Trigger Pearson's per-widget grading callbacks. These
+              //    exist on the prototype and notify the parent that the
+              //    widget's answered state changed.
               try { if (typeof w.updateControlState === "function") w.updateControlState(); } catch (_) {}
               try { if (typeof w.answeredCommand === "function") w.answeredCommand(); } catch (_) {}
               try { if (typeof w.answerAppliedCommand === "function") w.answerAppliedCommand(); } catch (_) {}
+
               // Verify selection took
-              const got = w.selectedIndex;
-              return { ok: true, method: "selectedIndex", selectedIndex: got };
+              return {
+                ok: true,
+                method: menuClickFired ? "menuItemClicked" : "selectedIndex",
+                selectedIndex: w.selectedIndex,
+                isEmpty: w.isEmpty,
+                response: w.response,
+                menuClickError: menuClickError || undefined,
+              };
             } catch (e) {
               return { ok: false, reason: "set failed: " + e.message };
             }
